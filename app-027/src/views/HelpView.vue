@@ -84,7 +84,8 @@ const faqOpen = ref<number | null>(0)
       <div class="card">
         <p class="hint">
           一键跑完第 10 节全部验收用例：导入 10 个真实窗花 SVG、连刀点宽度与几何偏差、碎片必连刀、长度规则数量、嵌套 3 层、先内后外、2-opt 跳刀缩短
-          ≥15%、PLT 坐标范围与左下原点、G-code 单位与进给、A4 校验尺 1:1、5000 点性能、刀补自交裁剪。
+          ≥15%、PLT 坐标范围与左下原点、G-code 单位与进给、A4 校验尺 1:1、5000 点性能、刀补自交裁剪，
+          以及刀具台账 7 条（折算公式 / 纸张系数差异 / 到寿移出可选列表 / 换刀冻结旧账 / 调系数历史重算 / 调低后状态恢复 / 改材料预设不影响旧账）。
         </p>
         <div class="btn-row" style="margin: 8px 0">
           <button class="primary" :disabled="running" @click="run">{{ running ? '自检中…' : '运行验收自检' }}</button>

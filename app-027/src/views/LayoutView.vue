@@ -8,6 +8,8 @@ import type { ComputedShape } from '@/logic/pipeline'
 import type { Pt } from '@/logic/types'
 import { boundsOf, mergeBounds } from '@/logic/geometry'
 import { computePlacement, SHEET_MARGIN_MM } from '@/logic/exporters'
+import { currentKnife, knifeActions, ledger, selectableKnives, statsOf, defaultFactorFor } from '@/logic/knives'
+import { paperLabel } from '@/data/materials'
 
 const route = useRoute()
 const router = useRouter()
@@ -243,6 +245,67 @@ const boundsInfo = computed(() => {
   const b = mergeBounds([boundsOf(pts)])
   return { w: b.maxX - b.minX, h: b.maxY - b.minY }
 })
+
+// ---------------- 刀具磨损记账 ----------------
+/** 记一笔时选用的刀（默认当前在用刀；到寿后只能先换刀） */
+const logKnifeId = ref<string>('')
+const logNotice = ref('')
+
+const knifeList = computed(() => selectableKnives(ledger))
+const activeKnife = computed(() => currentKnife(ledger))
+const chosenKnife = computed(() => ledger.knives.find((k) => k.id === logKnifeId.value) ?? activeKnife.value ?? null)
+const knifeStats = computed(() => (chosenKnife.value ? statsOf(ledger, chosenKnife.value.id) : null))
+
+/** 多形状多图层：整场刀路总量（job 已按全场求和），再乘当前材料的重复遍数 */
+const effectiveCutMeters = computed(() => ((job.value?.cutLengthMm ?? 0) * (material.value?.passes ?? 1)) / 1000)
+
+function currentFactor(): number {
+  if (!chosenKnife.value || !material.value) return 1
+  const v = ledger.factors[chosenKnife.value.id]?.[material.value.paper]
+  return typeof v === 'number' ? v : defaultFactorFor(material.value.paper)
+}
+
+const wearPreview = computed(() => effectiveCutMeters.value * currentFactor())
+const wearAfter = computed(() => (knifeStats.value ? knifeStats.value.wear + wearPreview.value : wearPreview.value))
+
+function syncLogKnife(): void {
+  if (!knifeList.value.some((k) => k.id === logKnifeId.value)) {
+    logKnifeId.value = activeKnife.value?.id ?? knifeList.value[0]?.id ?? ''
+  }
+}
+
+watch(
+  [knifeList, activeKnife],
+  () => syncLogKnife(),
+  { immediate: true },
+)
+
+function logCut(): void {
+  const p = project.value
+  if (!p || !material.value || !chosenKnife.value) return
+  const lenMm = job.value?.cutLengthMm ?? 0
+  if (lenMm <= 0) {
+    logNotice.value = '当前没有刀路，无法记账'
+    return
+  }
+  const rec = knifeActions.logCut({
+    knifeId: chosenKnife.value.id,
+    projectName: p.name,
+    paper: material.value.paper,
+    cutLengthMm: lenMm,
+    passes: material.value.passes,
+  })
+  if (!rec) {
+    logNotice.value = '这把刀已到寿或已退役，请先换刀'
+    return
+  }
+  const st = statsOf(ledger, chosenKnife.value.id)
+  if (st.wear + 1e-9 >= chosenKnife.value.wearLimit) {
+    logNotice.value = `已记账：本场折算磨损 +${wearPreview.value.toFixed(1)}，「${chosenKnife.value.name}」累计 ${st.wear.toFixed(1)} 已到上限，该换刀了！`
+  } else {
+    logNotice.value = `已记账：本场 +${wearPreview.value.toFixed(1)} 折算米，「${chosenKnife.value.name}」剩余 ${(chosenKnife.value.wearLimit - st.wear).toFixed(1)} 折算米`
+  }
+}
 </script>
 
 <template>
@@ -424,6 +487,67 @@ const boundsInfo = computed(() => {
             <button class="tiny" @click="router.push(`/export/${project.id}`)">导出刀路</button>
           </div>
         </div>
+
+        <div class="section knife-ledger">
+          <div class="section-title">
+            刀具磨损记账
+            <span class="spacer" style="margin-left: auto"></span>
+            <RouterLink class="tag" to="/knives">打开台账 →</RouterLink>
+          </div>
+
+          <div v-if="ledger.knives.length === 0" class="banner info-light">
+            还没有登记刀具。<RouterLink to="/knives">去登记第一把刀（上机时间 / 刀刃角度）</RouterLink>
+          </div>
+          <template v-else>
+            <div v-if="activeKnife && statsOf(ledger, activeKnife.id).wear + 1e-9 >= activeKnife.wearLimit" class="banner due">
+              当前在用刀「{{ activeKnife.name }}」已到寿（{{ statsOf(ledger, activeKnife.id).wear.toFixed(1) }} / {{ activeKnife.wearLimit }}），
+              已移出可选列表，请尽快
+              <RouterLink to="/knives">换刀</RouterLink>。
+            </div>
+
+            <div class="field-row">
+              <label>用刀</label>
+              <select v-model="logKnifeId">
+                <option v-for="k in knifeList" :key="k.id" :value="k.id">
+                  {{ k.name }}（{{ k.edgeAngleDeg }}°，剩 {{ statsOf(ledger, k.id).remaining.toFixed(0) }} 折算米）
+                </option>
+              </select>
+            </div>
+
+            <div v-if="chosenKnife && knifeStats" class="knife-mini">
+              <div class="life-bar">
+                <div
+                  class="life-fill"
+                  :style="{
+                    width: Math.min(100, knifeStats.usedRatio * 100) + '%',
+                    background: knifeStats.usedRatio >= 1 ? 'var(--err)' : knifeStats.usedRatio >= 0.8 ? 'var(--warn)' : 'var(--ok)',
+                  }"
+                ></div>
+              </div>
+              <div class="knife-mini-nums">
+                已磨损 {{ knifeStats.wear.toFixed(1) }} / {{ chosenKnife.wearLimit }}｜
+                实际已切 {{ knifeStats.rawMeters.toFixed(1) }} m｜剩 {{ knifeStats.remaining.toFixed(1) }} 折算米
+              </div>
+            </div>
+
+            <table class="grid" style="margin-top: 6px">
+              <tbody>
+                <tr><th>本场纸张</th><td>{{ material ? paperLabel(material.paper) : '-' }}</td></tr>
+                <tr><th>整场刀路</th><td class="num">{{ (job?.cutLengthMm ?? 0).toFixed(1) }} mm（多形状多图层合计）</td></tr>
+                <tr><th>重复遍数</th><td class="num">{{ material?.passes ?? 1 }}（以材料预设为准）</td></tr>
+                <tr><th>折算系数</th><td class="num">×{{ currentFactor() }}</td></tr>
+                <tr><th>本场磨损</th><td class="num">+{{ wearPreview.toFixed(2) }} 折算米</td></tr>
+                <tr><th>记账后累计</th><td class="num">{{ wearAfter.toFixed(1) }} / {{ chosenKnife?.wearLimit ?? '-' }}</td></tr>
+              </tbody>
+            </table>
+
+            <div class="btn-row" style="margin-top: 7px">
+              <button class="tiny primary" :disabled="!chosenKnife" @click="logCut">完成这一场，记一笔磨损</button>
+            </div>
+            <div v-if="logNotice" class="banner" :class="{ due: logNotice.includes('该换刀') }">{{ logNotice }}</div>
+            <div class="hint">刀压 / 速度 / 遍数仍以材料预设为准，改预设不会影响已经记下的账（每笔只存当时的纸张与遍数快照）。</div>
+          </template>
+        </div>
       </div>
     </div>
 
@@ -574,5 +698,51 @@ const boundsInfo = computed(() => {
   margin-top: 5mm;
   font-size: 9pt;
   color: #333;
+}
+
+.knife-ledger .banner {
+  background: rgba(71, 192, 122, 0.12);
+  border: 1px solid rgba(71, 192, 122, 0.35);
+  color: #9fe0b8;
+  padding: 6px 9px;
+  border-radius: 6px;
+  margin: 6px 0;
+  font-size: 11.5px;
+}
+
+.knife-ledger .banner.info-light {
+  background: rgba(90, 169, 255, 0.1);
+  border-color: rgba(90, 169, 255, 0.35);
+  color: #a9cdff;
+}
+
+.knife-ledger .banner.due {
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.45);
+  color: #ffb3b3;
+}
+
+.knife-mini {
+  margin-top: 6px;
+}
+
+.life-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-grid);
+  border: 1px solid var(--line-soft);
+  overflow: hidden;
+}
+
+.life-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.25s ease;
+}
+
+.knife-mini-nums {
+  font-size: 10.5px;
+  color: var(--text-mute);
+  margin-top: 2px;
 }
 </style>

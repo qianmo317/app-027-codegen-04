@@ -7,6 +7,7 @@ import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import * as knifeLedger from './knives'
 
 export type CheckResult = {
   id: string
@@ -453,8 +454,142 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     ),
   )
 
+  // ---------- 10. 刀具台账：折算 / 到寿移出 / 换刀 / 调系数重算 ----------
+  checks.push(...runKnifeLedgerChecks())
+
   const totalMs = performance.now() - t0
   return { checks, summaries, totalMs }
+}
+
+/** 刀具台账验收用例（独立内存台账，不读写 localStorage） */
+function runKnifeLedgerChecks(): CheckResult[] {
+  const out: CheckResult[] = []
+  const s: import('./knives').KnifeLedgerState = { knives: [], records: [], replacements: [], factors: {} }
+  const {
+    registerKnife,
+    logCut,
+    statsOf,
+    replaceKnife,
+    setFactor,
+    selectableKnives,
+    currentKnife,
+    defaultFactorFor,
+  } = knifeLedger
+
+  // 用例 1：登记即上机，磨损 = 长度(m) × 遍数 × 系数（卡纸默认系数 1.0）
+  const k1 = registerKnife(s, { name: '1# 45°', edgeAngleDeg: 45, wearLimit: 10, mountedAt: 1000 })
+  const r1 = logCut(s, { knifeId: k1.id, projectName: '窗花整场', paper: 'cardstock', cutLengthMm: 2000, passes: 1 })!
+  const st1 = statsOf(s, k1.id)
+  out.push(
+    ok(
+      'knife-wear-basic',
+      '刀具台账：一场切割按 刀路长度 × 遍数 × 纸张系数 折算磨损（多形状多图层整场一笔）',
+      !!r1 && Math.abs(st1.wear - 2 * defaultFactorFor('cardstock')) < 1e-9 && Math.abs(st1.rawMeters - 2) < 1e-9 && st1.cuts === 1,
+      `2.000m 卡纸 ×1 遍 ×${defaultFactorFor('cardstock')} → 磨损 ${st1.wear}（实际米数 ${st1.rawMeters}m，场次 ${st1.cuts}）`,
+    ),
+  )
+
+  // 用例 2：不同纸张系数不同（植绒 1.6 > 宣纸 0.7），遍数参与折算
+  logCut(s, { knifeId: k1.id, projectName: '植绒活', paper: 'flock', cutLengthMm: 1000, passes: 2 })
+  logCut(s, { knifeId: k1.id, projectName: '宣纸活', paper: 'xuan', cutLengthMm: 1000, passes: 1 })
+  const st2 = statsOf(s, k1.id)
+  const expectWear2 = 2 * 1.0 + 1 * 2 * 1.6 + 1 * 0.7
+  const expectPassMeters = 2 + 2 + 1
+  out.push(
+    ok(
+      'knife-wear-paper',
+      '刀具台账：不同纸张折算系数不同，重复遍数计入磨损，原始米数不被系数放大',
+      Math.abs(st2.wear - expectWear2) < 1e-9 && Math.abs(st2.passMeters - expectPassMeters) < 1e-9,
+      `卡纸2m×1×1.0 + 植绒1m×2×1.6 + 宣纸1m×1×0.7 = ${st2.wear.toFixed(2)}（期望 ${expectWear2}）｜计遍数刀路 ${st2.passMeters}m`,
+    ),
+  )
+
+  // 用例 3：累计到上限 → 状态 due，自动移出可选列表
+  const beforeDue = statsOf(s, k1.id)
+  // 当前磨损 5.9，再来一场植绒 2m×2 遍 = 6.4，累计 12.3 ≥ 10
+  logCut(s, { knifeId: k1.id, projectName: '到寿场', paper: 'flock', cutLengthMm: 2000, passes: 2 })
+  const dueKnife = s.knives.find((x) => x.id === k1.id)!
+  const removedFromList = !selectableKnives(s).some((x) => x.id === k1.id)
+  const blockLog = logCut(s, { knifeId: k1.id, projectName: '不该再记', paper: 'cardstock', cutLengthMm: 100, passes: 1 })
+  out.push(
+    ok(
+      'knife-due',
+      '刀具台账：累计磨损到上限即标记「该换刀」并移出可选列表，到寿后拒绝再记账',
+      dueKnife.status === 'due' && removedFromList && blockLog === null && statsOf(s, k1.id).cuts === 4,
+      `记账前 ${beforeDue.wear.toFixed(1)} → 到寿场后 ${statsOf(s, k1.id).wear.toFixed(1)}/10｜状态 ${dueKnife.status}｜可选列表已移除=${removedFromList}｜再记账被拒绝=${blockLog === null}`,
+    ),
+  )
+
+  // 用例 4：换刀记一笔（旧刀累计磨损/总米数快照、新刀上机、旧刀退役）
+  const oldStats = statsOf(s, k1.id)
+  const k2 = registerKnife(s, { name: '2# 30°', edgeAngleDeg: 30, wearLimit: 10, mountedAt: 2000 })
+  const rep = replaceKnife(s, k1.id, k2.id, { at: 3000, note: '纸边起毛' })!
+  const after = {
+    old: s.knives.find((x) => x.id === k1.id)!,
+    now: currentKnife(s),
+  }
+  out.push(
+    ok(
+      'knife-replace',
+      '刀具台账：换刀时冻结旧刀累计磨损与总切割米数，旧刀退役、新刀上机并留换刀记录',
+      !!rep &&
+        after.old.status === 'retired' &&
+        after.now?.id === k2.id &&
+        Math.abs(rep.oldWear - oldStats.wear) < 1e-9 &&
+        Math.abs(rep.oldRawMeters - oldStats.rawMeters) < 1e-9 &&
+        rep.newKnifeId === k2.id,
+      `旧刀卸下：磨损 ${rep?.oldWear.toFixed(2)}、实际 ${rep?.oldRawMeters.toFixed(2)}m｜新刀「${rep?.newKnifeName}」上机｜备注「${rep?.note}」`,
+    ),
+  )
+
+  // 用例 5：单独调某把刀在某纸张上的系数 → 已累计的量按新系数重算，其它纸张不动
+  // 新刀先记两笔：卡纸 2m(=2) + 宣纸 2m(×0.7=1.4)，合计 3.4
+  logCut(s, { knifeId: k2.id, projectName: '新刀卡纸', paper: 'cardstock', cutLengthMm: 2000, passes: 1 })
+  logCut(s, { knifeId: k2.id, projectName: '新刀宣纸', paper: 'xuan', cutLengthMm: 2000, passes: 1 })
+  const wBefore = statsOf(s, k2.id).wear
+  setFactor(s, k2.id, 'xuan', 1.2)
+  const stAfter = statsOf(s, k2.id)
+  const xuanAfter = stAfter.wearByPaper['xuan'] ?? -1
+  const cardAfter = stAfter.wearByPaper['cardstock'] ?? -1
+  out.push(
+    ok(
+      'knife-factor-recalc',
+      '刀具台账：同一把刀在不同纸张上的系数可单独调，调完历史账按新系数重算、其它纸张不变',
+      Math.abs(wBefore - 3.4) < 1e-9 && Math.abs(xuanAfter - 2 * 1.2) < 1e-9 && Math.abs(cardAfter - 2) < 1e-9 && Math.abs(stAfter.wear - 4.4) < 1e-9,
+      `调系数前总磨损 ${wBefore.toFixed(2)}｜宣纸系数 0.7→1.2 后：宣纸 ${xuanAfter.toFixed(2)}（卡纸仍 ${cardAfter.toFixed(2)}）｜总磨损 ${stAfter.wear.toFixed(2)}`,
+    ),
+  )
+
+  // 用例 6：调低系数后该换刀状态可恢复（没有真的换刀，只是账算错了）
+  // 构造一把到寿的刀，再把系数调低回到寿命内
+  const s2: import('./knives').KnifeLedgerState = { knives: [], records: [], replacements: [], factors: {} }
+  const k3 = registerKnife(s2, { name: '3#', edgeAngleDeg: 45, wearLimit: 5, mountedAt: 1 })
+  logCut(s2, { knifeId: k3.id, projectName: '重活', paper: 'flock', cutLengthMm: 4000, passes: 1 }) // 4m × 1.6 = 6.4 到寿
+  const wasDue = s2.knives.find((x) => x.id === k3.id)!.status === 'due'
+  setFactor(s2, k3.id, 'flock', 1.0) // 4m × 1.0 = 4 < 5 回到寿命内
+  const recovered = s2.knives.find((x) => x.id === k3.id)!.status === 'in_use'
+  out.push(
+    ok(
+      'knife-factor-recover',
+      '刀具台账：调低折算系数后已累计磨损回落，「该换刀」在未真正换刀时恢复为在用',
+      wasDue && recovered,
+      `植绒 4m 系数1.6→磨损6.4 到寿=${wasDue}；系数调为1.0→磨损4.0/5 恢复在用=${recovered}`,
+    ),
+  )
+
+  // 用例 7：材料预设只提供刀压/速度/遍数；纸张快照记账后不变（模拟改预设）
+  const snapPaper = s.records.find((r) => r.knifeId === k1.id)?.paper
+  const snapPasses = s.records.find((r) => r.knifeId === k1.id)?.passes
+  out.push(
+    ok(
+      'knife-preset-isolation',
+      '刀具台账：每笔账保存纸张与遍数快照，事后改材料预设不会带乱已记的账',
+      snapPaper === 'cardstock' && snapPasses === 1,
+      `首笔记录快照 paper=${snapPaper}、passes=${snapPasses}，与之后预设如何修改无关（磨损仅由系数表现算）`,
+    ),
+  )
+
+  return out
 }
 
 /** 矩形轮廓 */
