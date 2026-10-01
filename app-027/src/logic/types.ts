@@ -162,3 +162,108 @@ export const PAPER_KINDS: PaperKind[] = [
     note: '非遗剪纸常用，注意连刀点宽度',
   },
 ]
+
+// ---------------- 刀具台账 ----------------
+
+/** 刀具状态：active 在用/备用可选；retired 已换下（磨损到顶或手动退役），不再出现在可选列表 */
+export type BladeStatus = 'active' | 'retired'
+
+/** 换下原因：limit 磨损累计到上限；manual 手动提前换刀 */
+export type RetireReason = 'limit' | 'manual'
+
+/**
+ * 每把刀的档案：登记上机时间与刀刃角度，挂着它的全部切割流水。
+ * 磨损不直接落库，而是按流水（长度 × 纸张系数 × 遍数）实时折算，
+ * 这样改了某纸张的折算系数后，已经累计的量会自动跟着重算。
+ */
+export type Blade = {
+  id: string
+  /** 刀号/名称，如「45°-03」 */
+  name: string
+  /** 刀刃角度（度），常见 30 / 45 / 60 */
+  angleDeg: number
+  /** 登记上机时间（ms 时间戳） */
+  mountedAt: number
+  status: BladeStatus
+  /** 磨损上限（磨损点），累计达到即提醒换刀并移出可选列表 */
+  wearLimit: number
+  /** 该刀在各纸张上的折算系数：每米刀路产生多少磨损点，可逐纸单独调 */
+  wearFactors: Record<string, number>
+  /** 换下时记录原因 */
+  retireReason?: RetireReason
+  note?: string
+}
+
+/**
+ * 一次切割流水：多形状、多图层的活按整场总量汇总成一条。
+ * 纸张/遍数/刀压速度在记账时快照，之后改材料预设不影响旧账；
+ * 只存原始长度与遍数，磨损量由当前折算系数重算。
+ */
+export type CutRecord = {
+  id: string
+  bladeId: string
+  /** 切割完成时间（ms 时间戳） */
+  at: number
+  /** 纸张种类（材料预设的 paper key，记账时快照） */
+  paper: string
+  /** 纸张名称快照（材料预设 label），预设删除/改名后旧账仍可读 */
+  paperLabel: string
+  /** 本场实际切出的刀路总长 mm（不含跳刀，已含多形状/多图层/排版份数的全场总量） */
+  lengthMm: number
+  /** 实际重复遍数（记账时从材料预设快照带出，可在记账时修正） */
+  passes: number
+  /** 刀压快照 */
+  force: number
+  /** 速度快照 mm/s */
+  speedMmS: number
+  /** 活名/备注，如项目名 */
+  jobName?: string
+}
+
+/** 换刀记录：旧刀卸下时的累计磨损、总切割里程，以及换上的新刀 */
+export type BladeChangeLog = {
+  id: string
+  at: number
+  /** 换下的旧刀 */
+  bladeId: string
+  bladeName: string
+  /** 旧刀卸下瞬间的累计磨损（磨损点，按当时系数折算并固化） */
+  wearAtRetire: number
+  wearLimit: number
+  /** 旧刀一共切了多少米（按流水长度 × 遍数计） */
+  totalMetersAtRetire: number
+  /** 换下原因 */
+  reason: RetireReason
+  /** 换上的刀（可能是已登记的备用刀，也可能是当场新登记的刀） */
+  newBladeId: string
+  newBladeName: string
+  note?: string
+}
+
+/** 刀具台账全部持久化数据 */
+export type BladeLedger = {
+  blades: Blade[]
+  cuts: CutRecord[]
+  changes: BladeChangeLog[]
+  /** 当前装在机器上的刀；无刀（null）时切割记账需先选刀/登记新刀 */
+  mountedBladeId: string | null
+}
+
+/** 各纸张默认折算系数：每米刀路的磨损点（植绒最费刀，宣纸/不干胶较省） */
+export const DEFAULT_WEAR_FACTORS: Record<string, number> = {
+  cardstock: 1.0,
+  xuan: 0.6,
+  sticker: 0.5,
+  flock: 1.8,
+  kraft: 1.1,
+  'red-paper': 0.9,
+}
+
+/** 未单独配置系数的纸张（含自定义纸张）回退系数 */
+export const FALLBACK_WEAR_FACTOR = 1.0
+
+/** 新刀默认磨损上限（磨损点 ≈ 米数的经验尺度） */
+export const DEFAULT_BLADE_WEAR_LIMIT = 200
+
+/** 常用刀刃角度（度） */
+export const BLADE_ANGLES = [30, 45, 60] as const

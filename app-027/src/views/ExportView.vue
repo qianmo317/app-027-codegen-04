@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PreviewCanvas from '@/components/PreviewCanvas.vue'
-import { store } from '@/logic/store'
+import { store, state } from '@/logic/store'
 import { SHEET_PRESETS, type ExportCfg, type Sheet } from '@/logic/types'
 import type { ComputedShape } from '@/logic/pipeline'
 import {
@@ -17,6 +17,8 @@ import {
 } from '@/logic/exporters'
 import { downloadText, sanitizeFilename } from '@/logic/download'
 import { boundsOf } from '@/logic/geometry'
+import { PAPER_KINDS } from '@/logic/types'
+import { bladeStats, fmtNum, selectableBlades, wearFactorOf } from '@/logic/blade'
 
 const route = useRoute()
 const router = useRouter()
@@ -27,6 +29,58 @@ const project = computed(() => store.getProject(projectId.value) ?? null)
 const jobData = computed(() => (project.value ? store.jobOf(project.value) : null))
 const job = computed(() => jobData.value?.job ?? null)
 const material = computed(() => (project.value ? store.materialOf(project.value) : null))
+
+// ---------------- 切割完成记账（刀具台账） ----------------
+const ledger = computed(() => state.ledger)
+const mounted = computed(() => store.mountedBlade())
+const selectable = computed(() => selectableBlades(ledger.value.blades, ledger.value.cuts))
+
+const logForm = ref<{ open: boolean; bladeId: string; notice: string }>({
+  open: false,
+  bladeId: '',
+  notice: '',
+})
+
+/** 记账用的纸张/遍数取自当前材料预设（多形状多图层按整场总量，导出面板会带出全场刀路长度） */
+const logPaper = computed(() => material.value?.paper ?? 'cardstock')
+const logPasses = computed(() => material.value?.passes ?? 1)
+const logLengthMm = computed(() => job.value?.cutLengthMm ?? 0)
+const logFactor = computed(() => {
+  const b = ledger.value.blades.find((x) => x.id === logForm.value.bladeId)
+  return b ? wearFactorOf(b, logPaper.value) : 0
+})
+const logWear = computed(() => (logLengthMm.value / 1000) * logPasses.value * logFactor.value)
+
+function toggleLog(): void {
+  logForm.value.open = !logForm.value.open
+  logForm.value.bladeId = mounted.value?.id ?? selectable.value[0]?.id ?? ''
+  logForm.value.notice = ''
+}
+
+function confirmLog(): void {
+  const p = project.value
+  const m = material.value
+  if (!p || !m || !job.value) return
+  const bladeId = logForm.value.bladeId || undefined
+  const res = store.logCut({
+    bladeId,
+    paper: m.paper,
+    paperLabel: PAPER_KINDS.find((k) => k.paper === m.paper)?.label ?? m.paper,
+    lengthMm: job.value.cutLengthMm,
+    passes: m.passes,
+    force: m.force,
+    speedMmS: m.speedMmS,
+    jobName: p.name,
+  })
+  if (!res) {
+    logForm.value.notice = '记账失败：没有可选刀具，请到刀具台账登记新刀'
+    return
+  }
+  const s = bladeStats(res.blade, ledger.value.cuts)
+  logForm.value.notice = res.wornOut
+    ? `已记账：${res.blade.name} 累计磨损 ${fmtNum(s.wear)} 已到上限 ${res.blade.wearLimit}，请尽快换刀（已移出可选列表）`
+    : `已给「${res.blade.name}」记一笔 +${fmtNum(logWear.value)} 磨损点，剩 ${fmtNum(s.remaining)}`
+}
 
 const shapesForCanvas = computed(() => {
   const p = project.value
@@ -302,6 +356,51 @@ function downloadA4(): void {
 
         <div class="section">
           <div class="section-title">
+            切完记账（刀具台账）
+            <span class="spacer"></span>
+            <button class="tiny" @click="toggleLog">{{ logForm.open ? '收起' : '记一笔磨损' }}</button>
+          </div>
+          <template v-if="logForm.open">
+            <div v-if="!mounted && selectable.length === 0" class="hint">
+              还没有登记刀具。<RouterLink to="/blades">去刀具台账登记一把刀 →</RouterLink>
+            </div>
+            <template v-else>
+              <div class="field-row">
+                <label>用刀</label>
+                <select v-model="logForm.bladeId">
+                  <option v-for="b in selectable" :key="b.id" :value="b.id">
+                    {{ b.name }}（{{ b.angleDeg }}°，剩 {{ fmtNum(bladeStats(b, ledger.cuts).remaining) }}
+                    /{{ fmtNum(b.wearLimit) }}）
+                  </option>
+                </select>
+              </div>
+              <div class="hint">
+                本场按当前预设「{{ material?.name ?? '—' }}」切：纸张
+                {{ PAPER_KINDS.find((k) => k.paper === logPaper)?.label ?? logPaper }}，
+                重复 {{ logPasses }} 遍，刀压 {{ material?.force }}、{{ material?.speedMmS }}mm/s（取自预设快照，改预设不影响旧账）。
+              </div>
+              <div class="hint">
+                整场刀路 {{ fmtNum(logLengthMm) }}mm（多形状/多图层合计、不含跳刀）→
+                折算 <strong class="accent-text">+{{ fmtNum(logWear) }}</strong> 磨损点
+                （系数 {{ fmtNum(logFactor, 2) }}/m）。
+              </div>
+              <div class="btn-row" style="margin-top: 6px">
+                <button class="tiny primary" @click="confirmLog">切完，确认记账</button>
+                <RouterLink class="tiny" to="/blades">打开台账</RouterLink>
+              </div>
+            </template>
+            <div v-if="logForm.notice" class="log-notice" :class="{ warn: logForm.notice.includes('到上限') || logForm.notice.includes('失败') }">
+              {{ logForm.notice }}
+            </div>
+          </template>
+          <div v-else-if="mounted" class="hint">
+            当前装机：{{ mounted.name }}（{{ mounted.angleDeg }}°），剩
+            {{ fmtNum(bladeStats(mounted, ledger.cuts).remaining) }} / {{ fmtNum(mounted.wearLimit) }} 磨损点。
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-title">
             文件预览（前 60 行 / 共 {{ lineCount }} 行）
             <span class="spacer"></span>
             <button class="tiny" @click="doDownload">下载</button>
@@ -359,6 +458,27 @@ function downloadA4(): void {
   font-size: 12px;
   color: var(--text-dim);
   margin: 5px 0;
+}
+
+.accent-text {
+  color: var(--accent-2);
+  font-family: var(--mono);
+}
+
+.log-notice {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--ok);
+  background: rgba(71, 192, 122, 0.1);
+  border: 1px solid rgba(71, 192, 122, 0.3);
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+
+.log-notice.warn {
+  color: var(--warn);
+  background: rgba(255, 200, 87, 0.1);
+  border-color: rgba(255, 200, 87, 0.35);
 }
 
 .print-area .sheet :deep(svg) {
